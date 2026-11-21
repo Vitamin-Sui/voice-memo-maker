@@ -78,6 +78,7 @@ footer{margin-top:14px;display:flex;justify-content:center;gap:6px;font-size:12p
 .guide{margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:10px 14px}
 .guide summary{cursor:pointer;font-weight:800;font-size:13.5px}
 .guide ul{margin:8px 0 2px;padding-left:1.2em;font-size:12.5px;color:var(--sub);line-height:1.65}.guide li{margin:3px 0}.guide a{color:var(--accent);font-weight:700}
+.guideDate{margin:6px 0 2px;font-size:11px;color:var(--sub);text-align:right}
 footer a{color:var(--accent);font-weight:700}
 /* customize */
 .cTop{display:flex;align-items:center;gap:8px;margin-bottom:10px}
@@ -218,7 +219,7 @@ footer a{color:var(--accent);font-weight:700}
           <video id="outVideo" controls playsinline></video>
           <div class="bar"><span class="meta" id="outMeta"></span><span style="flex:1"></span><button class="mini pri" id="saveBtn">保存する</button></div>
           <div class="status" id="saveStatus"></div>
-          <p class="hint">作った動画の使い方は、下の「ご利用ガイドライン」をご覧ください。</p>
+          <p class="hint">作った動画の使い方は、下の「ご利用について・ガイドライン」をご覧ください。</p>
         </div>
         <ul class="tips">
           <li>つくるのに、音声と同じくらいの時間がかかります。終わるまでこの画面を開いたままにしてね。</li>
@@ -227,18 +228,20 @@ footer a{color:var(--accent);font-weight:700}
         </ul>
       </section>
       <details class="guide" id="guide">
-        <summary>ご利用ガイドライン</summary>
+        <summary>ご利用について・ガイドライン</summary>
         <ul>
           <li>作った動画は、SNSや動画サイトに自由に投稿できます。クレジットは任意です（書いてもらえるとうれしいです）。</li>
-          <li>YouTubeの収益化やメンバーシップ、サブスク、投げ銭など、投稿先のサービスに備わっている仕組みでの収益化はOKです。</li>
-          <li>企業や団体の案件、広告、販売する商品への使用など、それ以外の商用利用は、事前にXのDM（<a href="https://x.com/vitamin_sui" target="_blank" rel="noopener">@vitamin_sui</a>）でご相談ください。</li>
+          <li>YouTubeの収益化やメンバーシップ、XやTwitchのサブスク限定投稿、投げ銭など、投稿先のサービスに備わっている仕組みでの収益化はOKです。</li>
+          <li>支援サイト（pixivFANBOX、Fantiaなど）の支援者向け特典や、ライブ配信アプリのイベント特典として、ファンの方に届けるのもOKです。</li>
+          <li>動画の販売や商品の購入特典への使用、企業や団体の案件・広告への使用、ほかの方から依頼を受けて有料で制作する場合は、事前にXのDM（<a href="https://x.com/vitamin_sui" target="_blank" rel="noopener">@vitamin_sui</a>）でご相談ください。</li>
           <li>透かしを消したり隠したりする加工、このツールのデータやイラストを複製して別の場所で公開・配布することはご遠慮ください。URLの共有は大歓迎です。</li>
           <li>音声や画像は、お使いの端末のブラウザの中だけで処理され、どこにも送信・保存されません。</li>
           <li>このツールの利用で起きたトラブルについては、責任を負いかねます。内容は予告なく変更することがあります。</li>
           <li>フォントは、すべてSIL Open Font License（OFL）のGoogle Fontsを使っています。</li>
         </ul>
+        <p class="guideDate">2026年11月21日更新</p>
       </details>
-      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0</span></footer>
+      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.1</span></footer>
     </div>
   </div>
 </div>
@@ -1509,6 +1512,7 @@ function stageUnit(D, P, FR, cloth, hl, gold) {   // cloth (flat + shadow + high
       d[i + 3] = (a + d[i + 3] / 255 * (1 - a)) * 255; }
   }
 }
+const CURTAIN_SWAY = {amp: 0, wave: 1.8, spd: 1, val: 0}; // 2026-11-21: sway turned off (real stage curtains hang still)
 let stageFgCache = {key: ''}, stageBackCache = {key: ''};
 function stageFg(F) {
   const key = F.col + F.gold; if (stageFgCache.key === key) return stageFgCache;
@@ -1537,11 +1541,30 @@ function drawCurtainArt(x, F, w, h, clk) {
   // width decides the size; square/tall get a little vertical stretch, then the drape keeps falling to the bottom
   const A = stageFg(F), s = Math.min(w / 1920, h / 1080), sy = Math.min(h / 1080, s * 1.4), m = A.mid, half = m.width / 2, mh = m.height * sy;
   x.save(); x.globalAlpha = F.op;
-  [[0, 0], [half, w - half * s]].forEach(([sx, dx]) => {
-    x.drawImage(m, sx, 0, half, m.height, dx, 0, half * s, mh);
-    if (mh < h) x.drawImage(m, sx, m.height - 30, half, 30, dx, mh - 1, half * s, h - mh + 1);
+  // gentle sway: the outer edge stays put, the inner (stage-side) edge drifts a little; the top hangs still
+  const SW = CURTAIN_SWAY;
+  const sway = (yn, ph) => { const g = Math.pow(Math.min(1, yn), 1.6);
+    return w * SW.amp * g * (Math.sin(clk * 0.95 * SW.spd + yn * SW.wave + ph) * 0.75 + Math.sin(clk * 0.53 * SW.spd + ph * 1.7) * 0.25); };
+  const ST = 6;
+  [[0, 0, 0], [half, 1, 2.1]].forEach(([sx, right, ph]) => {
+    const dw0 = half * s;
+    const strip = (sy0, sh, dy0, dy1, yn) => { if (dy1 <= dy0) return; const dw = Math.max(1, dw0 + sway(yn, ph));
+      x.drawImage(m, sx, sy0, half, sh, right ? w - dw : 0, dy0, dw, dy1 - dy0); };
+    // when the art is shorter than the frame, stop 30px early and stretch that band (minus the very last rows) to the bottom
+    const ext = mh < h, endY = ext ? m.height - 30 : m.height;
+    for (let y0 = 0; y0 < endY; y0 += ST) { const sh = Math.min(ST, endY - y0);
+      strip(y0, sh, Math.round(y0 * sy), Math.round((y0 + sh) * sy), (y0 + sh * 0.5) * sy / h); }
+    if (ext) { const top = Math.round(endY * sy), n = Math.ceil((h - top) / (ST * 2)), band = 26;
+      for (let k = 0; k < n; k++) { const a = top + Math.round((h - top) * k / n), b = top + Math.round((h - top) * (k + 1) / n);
+        strip(endY + band * k / n, band / n, a, b, (a + b) / 2 / h); } }
   });
-  const f = A.front; x.drawImage(f, (w - f.width * s) / 2, 0, f.width * s, f.height * s);
+  const f = A.front, fx0 = (w - f.width * s) / 2;
+  if (!SW.val) x.drawImage(f, fx0, 0, f.width * s, f.height * s);
+  else { // valance: the top hangs still, the fringe below drifts sideways a little
+    const n = 48, fh = f.height;
+    for (let k = 0; k < n; k++) { const y0 = fh * k / n, y1 = fh * (k + 1) / n, yn = (y0 + y1) / 2 / fh, g = Math.pow(yn, 2.2);
+      const dx = w * SW.val * g * Math.sin(clk * 1.1 * SW.spd + yn * 2.4);
+      x.drawImage(f, 0, y0, f.width, y1 - y0, fx0 + dx, y0 * s, f.width * s, (y1 - y0) * s + 0.6); } }
   x.restore();
 }
 /* foreground: theatre curtain (provisional, drawn in code) */
