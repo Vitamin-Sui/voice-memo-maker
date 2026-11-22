@@ -241,7 +241,7 @@ footer a{color:var(--accent);font-weight:700}
         </ul>
         <p class="guideDate">2026年11月21日更新</p>
       </details>
-      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.2</span></footer>
+      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.3</span></footer>
     </div>
   </div>
 </div>
@@ -2247,6 +2247,9 @@ $('exportBtn').onclick = async () => {
   const [W, H] = SIZES[L.aspect]; cv.width = W; cv.height = H;
   const a = ac(); try { await a.resume(); } catch (_) {}
   const dest = a.createMediaStreamDestination(), {src, an} = makeSource(a); src.connect(dest); if ($('monitorIn').checked) src.connect(a.destination);
+  // keep the recorded audio track running until the very end (2026-11-22): once the voice source finishes,
+  // Chrome stops feeding the recorder, so the last ~0.1–0.2 s of speech and the silent tail were dropped
+  const keep = a.createConstantSource(), kg = a.createGain(); keep.offset.value = 1; kg.gain.value = 0.00001; keep.connect(kg); kg.connect(dest); keep.start();
   const look = clone(L); render(cx2, look, A, W, H, 0, {clk: 0});
   const vs = cv.captureStream(30), stream = new MediaStream([...vs.getVideoTracks(), ...dest.stream.getAudioTracks()]);
   let rec; try { rec = new MediaRecorder(stream, mime ? {mimeType: mime, videoBitsPerSecond: 6000000, audioBitsPerSecond: 160000} : {}); } catch (_) { rec = new MediaRecorder(stream); }
@@ -2260,7 +2263,7 @@ $('exportBtn').onclick = async () => {
       bar.style.width = clamp((now - ts + lead) / (dur + lead + tail) * 100, 0, 100) + '%';
       if (now >= ts + dur + tail || cancelled) { res(); return; } requestAnimationFrame(f); }; f(); });
   try { src.stop(); } catch (_) {}
-  rec.stop(); await stopped; vs.getTracks().forEach(t => t.stop());
+  rec.stop(); await stopped; try { keep.stop(); keep.disconnect(); kg.disconnect(); } catch (_) {} vs.getTracks().forEach(t => t.stop());
   level = 0; spec.fill(0); exporting = false; lockUI(false); $('exportLabel').textContent = '動画をつくる'; $('prog').hidden = true; sizeStage();
   if (cancelled) { setStatus('キャンセルしました'); bar.style.width = '0'; return; }
   const type = (rec.mimeType || mime || 'video/webm').split(';')[0], ext = type.includes('mp4') ? 'mp4' : 'webm'; let blob = new Blob(chunks, {type});
