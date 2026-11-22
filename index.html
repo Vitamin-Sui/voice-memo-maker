@@ -241,7 +241,7 @@ footer a{color:var(--accent);font-weight:700}
         </ul>
         <p class="guideDate">2026年11月21日更新</p>
       </details>
-      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.1</span></footer>
+      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.2</span></footer>
     </div>
   </div>
 </div>
@@ -1640,6 +1640,111 @@ function render(x, L, A, w, h, t, o) {
   return G;
 }
 
+/* ---------- MP4 defragment (2026-11-22) ----------
+   Chrome's and Safari's MediaRecorder write "fragmented" MP4: the header (moov) says the
+   length is 0 and the real samples live in many small moof+mdat pieces. Players that only
+   read the header (phone galleries, some upload screens) then show no duration.
+   defragMp4() rewrites such a file into an ordinary MP4 with a full sample table and the
+   header in front (fast start). It returns null when the input is not fragmented or looks
+   unusual, and the caller then keeps the original file. */
+function defragMp4(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const str = o => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+  const u64 = o => dv.getUint32(o) * 4294967296 + dv.getUint32(o + 4);
+  function kids(s, e) { const out = [];
+    while (s + 8 <= e) { let sz = dv.getUint32(s), h = 8; const t = str(s + 4);
+      if (sz === 1) { sz = u64(s + 8); h = 16; } else if (sz === 0) sz = e - s;
+      if (sz < h || s + sz > e) throw new Error('bad box ' + t);
+      out.push({t, s, e: s + sz, d: s + h}); s += sz; }
+    return out; }
+  const one = (list, t) => list.find(b => b.t === t);
+  const top = kids(0, u8.length), moov = one(top, 'moov');
+  if (!moov || !top.some(b => b.t === 'moof')) return null;
+  const mv = kids(moov.d, moov.e), mvhd = one(mv, 'mvhd');
+  const movTs = dv.getUint32(mvhd.d + (u8[mvhd.d] === 1 ? 20 : 12));
+  const trex = {}; const mvex = one(mv, 'mvex');
+  if (mvex) for (const b of kids(mvex.d, mvex.e)) if (b.t === 'trex') {
+    const o = b.d + 4; trex[dv.getUint32(o)] = {dur: dv.getUint32(o + 8), size: dv.getUint32(o + 12), flags: dv.getUint32(o + 16)}; }
+  const tracks = [];
+  for (const tk of mv.filter(b => b.t === 'trak')) {
+    const tc = kids(tk.d, tk.e), tkhd = one(tc, 'tkhd'), mdia = one(tc, 'mdia'), md = kids(mdia.d, mdia.e);
+    const mdhd = one(md, 'mdhd'), hdlr = one(md, 'hdlr'), minf = one(md, 'minf'), mi = kids(minf.d, minf.e);
+    const stbl = one(mi, 'stbl'), stsd = one(kids(stbl.d, stbl.e), 'stsd');
+    const id = dv.getUint32(tkhd.d + (u8[tkhd.d] === 1 ? 20 : 12));
+    tracks.push({id, tkhd, mdhd, hdlr, others: mi.filter(b => b.t !== 'stbl'), stsd,
+      ts: dv.getUint32(mdhd.d + (u8[mdhd.d] === 1 ? 20 : 12)), vide: str(hdlr.d + 8) === 'vide', samples: [], chunks: []}); }
+  const byId = {}; tracks.forEach(t => byId[t.id] = t);
+  for (const mf of top.filter(b => b.t === 'moof')) {
+    let next = mf.s;   // where data goes when a trun has no data_offset
+    for (const tf of kids(mf.d, mf.e).filter(b => b.t === 'traf')) {
+      const tc = kids(tf.d, tf.e), th = one(tc, 'tfhd'); let o = th.d; const fl = dv.getUint32(o) & 0xffffff; o += 4;
+      const tr = byId[dv.getUint32(o)]; o += 4; if (!tr) continue; const df = trex[tr.id] || {dur: 0, size: 0, flags: 0};
+      let base = mf.s; if (fl & 1) { base = u64(o); o += 8; } if (fl & 2) o += 4;
+      let dDur = df.dur, dSize = df.size, dFlags = df.flags;
+      if (fl & 8) { dDur = dv.getUint32(o); o += 4; } if (fl & 0x10) { dSize = dv.getUint32(o); o += 4; } if (fl & 0x20) { dFlags = dv.getUint32(o); o += 4; }
+      if (!(fl & 1) && !(fl & 0x20000)) base = next;
+      const tfdt = one(tc, 'tfdt'); let dts = tfdt ? (u8[tfdt.d] === 1 ? u64(tfdt.d + 4) : dv.getUint32(tfdt.d + 4)) : null;
+      if (dts === null) dts = tr.samples.length ? tr.samples[tr.samples.length - 1].dts + tr.samples[tr.samples.length - 1].dur : 0;
+      let pos = base;
+      for (const rn of tc.filter(b => b.t === 'trun')) {
+        let p = rn.d; const ver = u8[p], f = dv.getUint32(p) & 0xffffff; p += 4; const n = dv.getUint32(p); p += 4;
+        if (f & 1) { pos = base + dv.getInt32(p); p += 4; }
+        let first = null; if (f & 4) { first = dv.getUint32(p); p += 4; }
+        const start = pos;
+        for (let i = 0; i < n; i++) {
+          const s = {dur: dDur, size: dSize, flags: i === 0 && first !== null ? first : dFlags, cto: 0};
+          if (f & 0x100) { s.dur = dv.getUint32(p); p += 4; } if (f & 0x200) { s.size = dv.getUint32(p); p += 4; }
+          if (f & 0x400) { s.flags = dv.getUint32(p); p += 4; } if (f & 0x800) { s.cto = ver ? dv.getInt32(p) : dv.getUint32(p); p += 4; }
+          s.dts = dts; dts += s.dur; s.off = pos; pos += s.size;
+          if (s.off + s.size > u8.length) throw new Error('sample outside file');
+          tr.samples.push(s); }
+        if (n) tr.chunks.push({off: start, len: pos - start, n, tr}); }
+      next = pos; } }
+  if (!tracks.length || tracks.some(t => !t.samples.length)) return null;
+  // ---- write ----
+  const parts = []; let size = 0;
+  const box = (t, ...c) => { const l = c.reduce((a, b) => a + b.length, 8), b = new Uint8Array(l), v = new DataView(b.buffer);
+    v.setUint32(0, l); for (let i = 0; i < 4; i++) b[4 + i] = t.charCodeAt(i); let o = 8; for (const x of c) { b.set(x, o); o += x.length; } return b; };
+  const ints = (...a) => { const b = new Uint8Array(a.length * 4), v = new DataView(b.buffer); a.forEach((x, i) => v.setUint32(i * 4, x >>> 0)); return b; };
+  const raw = b => u8.slice(b.s, b.e);
+  const allChunks = tracks.flatMap(t => t.chunks).sort((a, b) => a.off - b.off);
+  let mdatLen = 0; for (const c of allChunks) { c.pos = mdatLen; mdatLen += c.len; }
+  const dur = t => t.samples.reduce((a, s) => a + s.dur, 0);
+  // durations are written as 32-bit (version 0) fields
+  const movDur = Math.max(...tracks.map(t => Math.round(dur(t) * movTs / t.ts)));
+  const head32 = (b, d) => { // rewrite mvhd/tkhd/mdhd as version 0 with a new duration
+    const v1 = u8[b.d] === 1, src = b.d + 4, dOff = b.t === 'tkhd' ? 4 : 0;
+    const times = v1 ? [u64(src), u64(src + 8)] : [dv.getUint32(src), dv.getUint32(src + 4)];
+    const mid = v1 ? (b.t === 'tkhd' ? [dv.getUint32(src + 16), dv.getUint32(src + 20)] : [dv.getUint32(src + 16)]) : (b.t === 'tkhd' ? [dv.getUint32(src + 8), dv.getUint32(src + 12)] : [dv.getUint32(src + 8)]);
+    const rest = u8.slice(v1 ? src + (b.t === 'tkhd' ? 32 : 28) : src + (b.t === 'tkhd' ? 20 : 16), b.e);
+    const fl = dv.getUint32(b.d) & 0xffffff;
+    const head = ints(b.t === 'tkhd' ? (fl | 3) : fl, Math.min(times[0], 4294967295), Math.min(times[1], 4294967295), ...mid);
+    return box(b.t, head, ints(d), rest); };
+  const stblFor = (t, chunkOff) => {
+    const ss = t.samples, stts = []; for (const s of ss) { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); }
+    const out = [raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
+    if (ss.some(s => s.cto)) { const c = []; for (const s of ss) { const l = c[c.length - 1]; if (l && l[1] === s.cto) l[0]++; else c.push([1, s.cto]); }
+      out.push(box('ctts', ints(ss.some(s => s.cto < 0) ? 0x01000000 : 0, c.length, ...c.flat()))); }
+    const sc = []; t.chunks.forEach((c, i) => { const l = sc[sc.length - 1]; if (!l || l[1] !== c.n) sc.push([i + 1, c.n, 1]); });
+    out.push(box('stsc', ints(0, sc.length, ...sc.flat())));
+    out.push(box('stsz', ints(0, 0, ss.length, ...ss.map(s => s.size))));
+    out.push(box('stco', ints(0, t.chunks.length, ...t.chunks.map(c => chunkOff + c.pos))));
+    if (t.vide) { const sync = []; ss.forEach((s, i) => { if (!(s.flags & 0x10000)) sync.push(i + 1); });
+      if (sync.length && sync.length < ss.length) out.push(box('stss', ints(0, sync.length, ...sync))); }
+    return box('stbl', ...out); };
+  const ftyp = box('ftyp', new TextEncoder().encode('isom'), ints(512), new TextEncoder().encode('isomiso2mp41' + (tracks.some(t => t.vide) ? 'avc1' : '')));
+  const build = chunkOff => box('moov', head32(mvhd, movDur), ...tracks.map(t => box('trak', head32(t.tkhd, Math.round(dur(t) * movTs / t.ts)),
+    box('mdia', head32(t.mdhd, dur(t)), raw(t.hdlr), box('minf', ...t.others.map(raw), stblFor(t, chunkOff))))));
+  const moovLen = build(0).length, dataStart = ftyp.length + moovLen + 8;
+  if (dataStart + mdatLen > 4294967295) return null;
+  const out = new Uint8Array(dataStart + mdatLen); let o = 0;
+  out.set(ftyp, o); o += ftyp.length; const mo = build(dataStart); out.set(mo, o); o += mo.length;
+  new DataView(out.buffer).setUint32(o, mdatLen + 8); out.set([109, 100, 97, 116], o + 4); o += 8;
+  for (const c of allChunks) { out.set(u8.subarray(c.off, c.off + c.len), o); o += c.len; }
+  return out;
+}
+
+
 /* =========================================================
    ui.js — state, controls, preview, picker, export
    ========================================================= */
@@ -2158,7 +2263,9 @@ $('exportBtn').onclick = async () => {
   rec.stop(); await stopped; vs.getTracks().forEach(t => t.stop());
   level = 0; spec.fill(0); exporting = false; lockUI(false); $('exportLabel').textContent = '動画をつくる'; $('prog').hidden = true; sizeStage();
   if (cancelled) { setStatus('キャンセルしました'); bar.style.width = '0'; return; }
-  const type = (rec.mimeType || mime || 'video/webm').split(';')[0], ext = type.includes('mp4') ? 'mp4' : 'webm', blob = new Blob(chunks, {type});
+  const type = (rec.mimeType || mime || 'video/webm').split(';')[0], ext = type.includes('mp4') ? 'mp4' : 'webm'; let blob = new Blob(chunks, {type});
+  if (ext === 'mp4') { setStatus('仕上げ中…');   // write the length into the file (see mp4fix.js)
+    try { const fixed = defragMp4(await blob.arrayBuffer()); if (fixed) blob = new Blob([fixed], {type: 'video/mp4'}); } catch (e) { console.warn('mp4 fix skipped', e); } }
   if (result) URL.revokeObjectURL(result.url); result = {blob, ext, url: URL.createObjectURL(blob)};
   $('outVideo').src = result.url; $('outMeta').textContent = `${ext.toUpperCase()}・${(blob.size / 1048576).toFixed(1)}MB・${fmt(Math.round(dur))}`;
   $('result').hidden = false; $('saveStatus').textContent = ''; setStatus('できました！下で確認して保存してね');

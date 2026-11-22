@@ -2,7 +2,7 @@
 
 音声投稿風の動画をつくれるツールです。
 
-made by びたみんすい（[@vitamin_sui](https://x.com/vitamin_sui)）・ver.1.0.1
+made by びたみんすい（[@vitamin_sui](https://x.com/vitamin_sui)）・ver.1.0.2
 
 ## ご利用について・ガイドライン
 
