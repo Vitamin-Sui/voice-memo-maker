@@ -241,7 +241,7 @@ footer a{color:var(--accent);font-weight:700}
         </ul>
         <p class="guideDate">2026年11月21日更新</p>
       </details>
-      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.3</span></footer>
+      <footer>made by <a id="credit" href="https://x.com/vitamin_sui" target="_blank" rel="noopener">びたみんすい</a><span aria-hidden="true">・</span><span>ver.1.0.4</span></footer>
     </div>
   </div>
 </div>
@@ -1647,6 +1647,60 @@ function render(x, L, A, w, h, t, o) {
    defragMp4() rewrites such a file into an ordinary MP4 with a full sample table and the
    header in front (fast start). It returns null when the input is not fragmented or looks
    unusual, and the caller then keeps the original file. */
+
+/* ---------- color range fix (2026-11-26) ----------
+   Chrome's recorder writes the picture in "limited" range (black 16, white 235) but labels the
+   file as "full" range with the sRGB transfer. Players that trust the label show the video
+   washed out (blacks turn grey, whites dull). fixColorLabel() rewrites only that label – the
+   picture data is untouched – and only when it carries Chrome's exact signature
+   (full range + sRGB transfer), so correctly labelled files from other browsers are left alone. */
+function fixColorLabel(stsd) {
+  const b = stsd.slice(), dv = new DataView(b.buffer);
+  const str = o => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  let changed = false, chromeSig = false;
+  const eStart = 16; if (b.length < eStart + 8) return stsd;
+  const eSize = dv.getUint32(eStart), eType = str(eStart + 4);
+  if (!['avc1', 'avc3', 'vp09', 'hvc1', 'hev1', 'av01'].includes(eType)) return stsd;
+  const kidsStart = eStart + 86, eEnd = eStart + eSize; const kids = [];
+  for (let o = kidsStart; o + 8 <= eEnd;) { const sz = dv.getUint32(o); if (sz < 8 || o + sz > eEnd) break; kids.push({t: str(o + 4), o, sz}); o += sz; }
+  const colr = kids.find(k => k.t === 'colr' && str(k.o + 8) === 'nclx');
+  if (colr) { const tr = dv.getUint16(colr.o + 14), fr = b[colr.o + 18] & 0x80;
+    if (fr && tr === 13) { chromeSig = true; b[colr.o + 18] &= 0x7f; changed = true; } }
+  else return stsd;            // no label in the container: leave it
+  if (!chromeSig) return stsd;
+  const vpcc = kids.find(k => k.t === 'vpcC'); if (vpcc) { b[vpcc.o + 14] &= 0xfe; }
+  const avcc = kids.find(k => k.t === 'avcC');
+  if (avcc) { const fixed = fixAvcC(b.subarray(avcc.o + 8, avcc.o + avcc.sz));
+    if (fixed) { // rebuild with possibly different avcC size
+      const delta = fixed.length - (avcc.sz - 8), out = new Uint8Array(b.length + delta), ov = new DataView(out.buffer);
+      out.set(b.subarray(0, avcc.o + 8)); out.set(fixed, avcc.o + 8); out.set(b.subarray(avcc.o + avcc.sz), avcc.o + 8 + fixed.length);
+      ov.setUint32(0, dv.getUint32(0) + delta); ov.setUint32(eStart, eSize + delta); ov.setUint32(avcc.o, avcc.sz + delta); return out; } }
+  return changed ? b : stsd;
+}
+function fixAvcC(c) { // clear video_full_range_flag in every SPS (returns null if nothing to do or unsure)
+  try {
+    const out = [...c.subarray(0, 5)]; let o = 5, n = c[o++] & 0x1f, any = false; out.push(c[5]);
+    for (let i = 0; i < n; i++) { const len = (c[o] << 8) | c[o + 1]; o += 2; let nal = c.subarray(o, o + len); o += len;
+      const f = spsClearFullRange(nal); if (f) { nal = f; any = true; } out.push(nal.length >> 8, nal.length & 255, ...nal); }
+    out.push(...c.subarray(o)); return any ? new Uint8Array(out) : null;
+  } catch (e) { return null; } }
+function spsClearFullRange(nal) {
+  const rb = []; for (let i = 1; i < nal.length; i++) { if (i >= 3 && nal[i] === 3 && nal[i - 1] === 0 && nal[i - 2] === 0 && rb.length >= 2 && rb[rb.length - 1] === 0 && rb[rb.length - 2] === 0) continue; rb.push(nal[i]); }
+  let p = 0; const bit = () => (rb[p >> 3] >> (7 - (p++ & 7))) & 1, u = n => { let v = 0; while (n--) v = v * 2 + bit(); return v; };
+  const ue = () => { let z = 0; while (!bit()) { if (++z > 31) throw 0; } return (1 << z) - 1 + u(z); }, se = () => { const k = ue(); return k & 1 ? (k + 1) / 2 : -k / 2; };
+  const prof = u(8); u(16); ue();
+  if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(prof)) { const cf = ue(); if (cf === 3) u(1); ue(); ue(); u(1); if (u(1)) return null; }
+  ue(); const poc = ue(); if (poc === 0) ue(); else if (poc === 1) { u(1); se(); se(); const k = ue(); for (let i = 0; i < k; i++) se(); }
+  ue(); u(1); ue(); ue(); if (!u(1)) u(1); u(1); if (u(1)) { ue(); ue(); ue(); ue(); }
+  if (!u(1)) return null;                        // no VUI
+  if (u(1)) { if (u(8) === 255) u(32); } if (u(1)) u(1);
+  if (!u(1)) return null;                        // no video_signal_type
+  u(3); const at = p; if (!bit()) return null;   // already limited
+  rb[at >> 3] &= ~(1 << (7 - (at & 7)));
+  const outN = [nal[0]]; let zeros = 0;          // re-insert emulation prevention bytes
+  for (const x of rb) { if (zeros >= 2 && x <= 3) { outN.push(3); zeros = 0; } outN.push(x); zeros = x === 0 ? zeros + 1 : 0; }
+  return new Uint8Array(outN); }
+
 function defragMp4(buf) {
   const u8 = new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const str = o => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
@@ -1701,6 +1755,10 @@ function defragMp4(buf) {
         if (n) tr.chunks.push({off: start, len: pos - start, n, tr}); }
       next = pos; } }
   if (!tracks.length || tracks.some(t => !t.samples.length)) return null;
+  // Chrome sometimes stamps two frames with the same time (duration 0), which some players dislike.
+  // Give each such sample 1 tick and take it back from the following samples, so the total length is unchanged.
+  for (const t of tracks) { let debt = 0;
+    for (const s of t.samples) { if (s.dur <= 0) { debt += 1 - s.dur; s.dur = 1; } else if (debt && s.dur > 1) { const k = Math.min(debt, s.dur - 1); s.dur -= k; debt -= k; } } }
   // ---- write ----
   const parts = []; let size = 0;
   const box = (t, ...c) => { const l = c.reduce((a, b) => a + b.length, 8), b = new Uint8Array(l), v = new DataView(b.buffer);
@@ -1722,7 +1780,7 @@ function defragMp4(buf) {
     return box(b.t, head, ints(d), rest); };
   const stblFor = (t, chunkOff) => {
     const ss = t.samples, stts = []; for (const s of ss) { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); }
-    const out = [raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
+    const out = [t.vide ? fixColorLabel(raw(t.stsd)) : raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
     if (ss.some(s => s.cto)) { const c = []; for (const s of ss) { const l = c[c.length - 1]; if (l && l[1] === s.cto) l[0]++; else c.push([1, s.cto]); }
       out.push(box('ctts', ints(ss.some(s => s.cto < 0) ? 0x01000000 : 0, c.length, ...c.flat()))); }
     const sc = []; t.chunks.forEach((c, i) => { const l = sc[sc.length - 1]; if (!l || l[1] !== c.n) sc.push([i + 1, c.n, 1]); });
