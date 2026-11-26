@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ボイスメモ動画メーカー 動作チェック</title>
+<style>
+body{font-family:system-ui,-apple-system,"Hiragino Sans",sans-serif;margin:0;padding:20px;background:#f7f5ff;color:#2e2b3a;line-height:1.6}
+h1{font-size:18px;margin:0 0 6px} p{font-size:14px;margin:6px 0}
+button{font:inherit;font-weight:700;border:0;border-radius:999px;padding:12px 22px;background:#4f4a66;color:#fff;margin:8px 8px 8px 0}
+button:disabled{opacity:.5}
+#cv{width:100%;max-width:480px;border-radius:10px;display:block;margin:10px 0}
+textarea{width:100%;box-sizing:border-box;height:340px;font:12px/1.5 ui-monospace,Menlo,monospace;border:1px solid #d8d2ee;border-radius:10px;padding:10px;background:#fff}
+#st{font-weight:700}
+</style></head><body>
+<h1>ボイスメモ動画メーカー 動作チェック</h1>
+<p>このページは、お使いの端末で動画がちゃんと作れるかを調べます。音声や画像は使わず、どこにも送信しません。</p>
+<p>「チェックを始める」を押したら、終わるまで<b>この画面を開いたまま</b>待ってください（10秒くらい）。少し音が鳴ります。</p>
+<button id="go">チェックを始める</button><button id="copy" disabled>結果をコピー</button>
+<p id="st"></p>
+<canvas id="cv" width="640" height="360"></canvas>
+<textarea id="out" readonly></textarea>
+<script>
+/* ---------- MP4 defragment (2026-11-22) ----------
+   Chrome's and Safari's MediaRecorder write "fragmented" MP4: the header (moov) says the
+   length is 0 and the real samples live in many small moof+mdat pieces. Players that only
+   read the header (phone galleries, some upload screens) then show no duration.
+   defragMp4() rewrites such a file into an ordinary MP4 with a full sample table and the
+   header in front (fast start). It returns null when the input is not fragmented or looks
+   unusual, and the caller then keeps the original file. */
+
+/* ---------- color range label (2026-11-26) — NOT USED ----------
+   Withdrawn the same day: a closer check showed Chrome's MP4 is full range AND labelled full range
+   (ffmpeg's yuv420p conversion had made it look limited), so relabelling it made colours too contrasty.
+   Kept only for reference; defragMp4() copies the colour label unchanged.
+   Chrome's recorder writes the picture in "limited" range (black 16, white 235) but labels the
+   file as "full" range with the sRGB transfer. Players that trust the label show the video
+   washed out (blacks turn grey, whites dull). fixColorLabel() rewrites only that label – the
+   picture data is untouched – and only when it carries Chrome's exact signature
+   (full range + sRGB transfer), so correctly labelled files from other browsers are left alone. */
+function fixColorLabel(stsd) {
+  const b = stsd.slice(), dv = new DataView(b.buffer);
+  const str = o => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  let changed = false, chromeSig = false;
+  const eStart = 16; if (b.length < eStart + 8) return stsd;
+  const eSize = dv.getUint32(eStart), eType = str(eStart + 4);
+  if (!['avc1', 'avc3', 'vp09', 'hvc1', 'hev1', 'av01'].includes(eType)) return stsd;
+  const kidsStart = eStart + 86, eEnd = eStart + eSize; const kids = [];
+  for (let o = kidsStart; o + 8 <= eEnd;) { const sz = dv.getUint32(o); if (sz < 8 || o + sz > eEnd) break; kids.push({t: str(o + 4), o, sz}); o += sz; }
+  const colr = kids.find(k => k.t === 'colr' && str(k.o + 8) === 'nclx');
+  if (colr) { const tr = dv.getUint16(colr.o + 14), fr = b[colr.o + 18] & 0x80;
+    if (fr && tr === 13) { chromeSig = true; b[colr.o + 18] &= 0x7f; changed = true; } }
+  else return stsd;            // no label in the container: leave it
+  if (!chromeSig) return stsd;
+  const vpcc = kids.find(k => k.t === 'vpcC'); if (vpcc) { b[vpcc.o + 14] &= 0xfe; }
+  const avcc = kids.find(k => k.t === 'avcC');
+  if (avcc) { const fixed = fixAvcC(b.subarray(avcc.o + 8, avcc.o + avcc.sz));
+    if (fixed) { // rebuild with possibly different avcC size
+      const delta = fixed.length - (avcc.sz - 8), out = new Uint8Array(b.length + delta), ov = new DataView(out.buffer);
+      out.set(b.subarray(0, avcc.o + 8)); out.set(fixed, avcc.o + 8); out.set(b.subarray(avcc.o + avcc.sz), avcc.o + 8 + fixed.length);
+      ov.setUint32(0, dv.getUint32(0) + delta); ov.setUint32(eStart, eSize + delta); ov.setUint32(avcc.o, avcc.sz + delta); return out; } }
+  return changed ? b : stsd;
+}
+function fixAvcC(c) { // clear video_full_range_flag in every SPS (returns null if nothing to do or unsure)
+  try {
+    const out = [...c.subarray(0, 5)]; let o = 5, n = c[o++] & 0x1f, any = false; out.push(c[5]);
+    for (let i = 0; i < n; i++) { const len = (c[o] << 8) | c[o + 1]; o += 2; let nal = c.subarray(o, o + len); o += len;
+      const f = spsClearFullRange(nal); if (f) { nal = f; any = true; } out.push(nal.length >> 8, nal.length & 255, ...nal); }
+    out.push(...c.subarray(o)); return any ? new Uint8Array(out) : null;
+  } catch (e) { return null; } }
+function spsClearFullRange(nal) {
+  const rb = []; for (let i = 1; i < nal.length; i++) { if (i >= 3 && nal[i] === 3 && nal[i - 1] === 0 && nal[i - 2] === 0 && rb.length >= 2 && rb[rb.length - 1] === 0 && rb[rb.length - 2] === 0) continue; rb.push(nal[i]); }
+  let p = 0; const bit = () => (rb[p >> 3] >> (7 - (p++ & 7))) & 1, u = n => { let v = 0; while (n--) v = v * 2 + bit(); return v; };
+  const ue = () => { let z = 0; while (!bit()) { if (++z > 31) throw 0; } return (1 << z) - 1 + u(z); }, se = () => { const k = ue(); return k & 1 ? (k + 1) / 2 : -k / 2; };
+  const prof = u(8); u(16); ue();
+  if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(prof)) { const cf = ue(); if (cf === 3) u(1); ue(); ue(); u(1); if (u(1)) return null; }
+  ue(); const poc = ue(); if (poc === 0) ue(); else if (poc === 1) { u(1); se(); se(); const k = ue(); for (let i = 0; i < k; i++) se(); }
+  ue(); u(1); ue(); ue(); if (!u(1)) u(1); u(1); if (u(1)) { ue(); ue(); ue(); ue(); }
+  if (!u(1)) return null;                        // no VUI
+  if (u(1)) { if (u(8) === 255) u(32); } if (u(1)) u(1);
+  if (!u(1)) return null;                        // no video_signal_type
+  u(3); const at = p; if (!bit()) return null;   // already limited
+  rb[at >> 3] &= ~(1 << (7 - (at & 7)));
+  const outN = [nal[0]]; let zeros = 0;          // re-insert emulation prevention bytes
+  for (const x of rb) { if (zeros >= 2 && x <= 3) { outN.push(3); zeros = 0; } outN.push(x); zeros = x === 0 ? zeros + 1 : 0; }
+  return new Uint8Array(outN); }
+
+function defragMp4(buf) {
+  const u8 = new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const str = o => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+  const u64 = o => dv.getUint32(o) * 4294967296 + dv.getUint32(o + 4);
+  function kids(s, e) { const out = [];
+    while (s + 8 <= e) { let sz = dv.getUint32(s), h = 8; const t = str(s + 4);
+      if (sz === 1) { sz = u64(s + 8); h = 16; } else if (sz === 0) sz = e - s;
+      if (sz < h || s + sz > e) throw new Error('bad box ' + t);
+      out.push({t, s, e: s + sz, d: s + h}); s += sz; }
+    return out; }
+  const one = (list, t) => list.find(b => b.t === t);
+  const top = kids(0, u8.length), moov = one(top, 'moov');
+  if (!moov || !top.some(b => b.t === 'moof')) return null;
+  const mv = kids(moov.d, moov.e), mvhd = one(mv, 'mvhd');
+  const movTs = dv.getUint32(mvhd.d + (u8[mvhd.d] === 1 ? 20 : 12));
+  const trex = {}; const mvex = one(mv, 'mvex');
+  if (mvex) for (const b of kids(mvex.d, mvex.e)) if (b.t === 'trex') {
+    const o = b.d + 4; trex[dv.getUint32(o)] = {dur: dv.getUint32(o + 8), size: dv.getUint32(o + 12), flags: dv.getUint32(o + 16)}; }
+  const tracks = [];
+  for (const tk of mv.filter(b => b.t === 'trak')) {
+    const tc = kids(tk.d, tk.e), tkhd = one(tc, 'tkhd'), mdia = one(tc, 'mdia'), md = kids(mdia.d, mdia.e);
+    const mdhd = one(md, 'mdhd'), hdlr = one(md, 'hdlr'), minf = one(md, 'minf'), mi = kids(minf.d, minf.e);
+    const stbl = one(mi, 'stbl'), stsd = one(kids(stbl.d, stbl.e), 'stsd');
+    const id = dv.getUint32(tkhd.d + (u8[tkhd.d] === 1 ? 20 : 12));
+    tracks.push({id, tkhd, mdhd, hdlr, others: mi.filter(b => b.t !== 'stbl'), stsd,
+      ts: dv.getUint32(mdhd.d + (u8[mdhd.d] === 1 ? 20 : 12)), vide: str(hdlr.d + 8) === 'vide', samples: [], chunks: []}); }
+  const byId = {}; tracks.forEach(t => byId[t.id] = t);
+  for (const mf of top.filter(b => b.t === 'moof')) {
+    let next = mf.s;   // where data goes when a trun has no data_offset
+    for (const tf of kids(mf.d, mf.e).filter(b => b.t === 'traf')) {
+      const tc = kids(tf.d, tf.e), th = one(tc, 'tfhd'); let o = th.d; const fl = dv.getUint32(o) & 0xffffff; o += 4;
+      const tr = byId[dv.getUint32(o)]; o += 4; if (!tr) continue; const df = trex[tr.id] || {dur: 0, size: 0, flags: 0};
+      let base = mf.s; if (fl & 1) { base = u64(o); o += 8; } if (fl & 2) o += 4;
+      let dDur = df.dur, dSize = df.size, dFlags = df.flags;
+      if (fl & 8) { dDur = dv.getUint32(o); o += 4; } if (fl & 0x10) { dSize = dv.getUint32(o); o += 4; } if (fl & 0x20) { dFlags = dv.getUint32(o); o += 4; }
+      if (!(fl & 1) && !(fl & 0x20000)) base = next;
+      const tfdt = one(tc, 'tfdt'); let dts = tfdt ? (u8[tfdt.d] === 1 ? u64(tfdt.d + 4) : dv.getUint32(tfdt.d + 4)) : null;
+      if (dts === null) dts = tr.samples.length ? tr.samples[tr.samples.length - 1].dts + tr.samples[tr.samples.length - 1].dur : 0;
+      let pos = base;
+      for (const rn of tc.filter(b => b.t === 'trun')) {
+        let p = rn.d; const ver = u8[p], f = dv.getUint32(p) & 0xffffff; p += 4; const n = dv.getUint32(p); p += 4;
+        if (f & 1) { pos = base + dv.getInt32(p); p += 4; }
+        let first = null; if (f & 4) { first = dv.getUint32(p); p += 4; }
+        const start = pos;
+        for (let i = 0; i < n; i++) {
+          const s = {dur: dDur, size: dSize, flags: i === 0 && first !== null ? first : dFlags, cto: 0};
+          if (f & 0x100) { s.dur = dv.getUint32(p); p += 4; } if (f & 0x200) { s.size = dv.getUint32(p); p += 4; }
+          if (f & 0x400) { s.flags = dv.getUint32(p); p += 4; } if (f & 0x800) { s.cto = ver ? dv.getInt32(p) : dv.getUint32(p); p += 4; }
+          s.dts = dts; dts += s.dur; s.off = pos; pos += s.size;
+          if (s.off + s.size > u8.length) throw new Error('sample outside file');
+          tr.samples.push(s); }
+        if (n) tr.chunks.push({off: start, len: pos - start, n, tr}); }
+      next = pos; } }
+  if (!tracks.length || tracks.some(t => !t.samples.length)) return null;
+  // Chrome sometimes stamps two frames with the same time (duration 0), which some players dislike.
+  // Give each such sample 1 tick and take it back from the following samples, so the total length is unchanged.
+  for (const t of tracks) { let debt = 0;
+    for (const s of t.samples) { if (s.dur <= 0) { debt += 1 - s.dur; s.dur = 1; } else if (debt && s.dur > 1) { const k = Math.min(debt, s.dur - 1); s.dur -= k; debt -= k; } } }
+  // ---- write ----
+  const parts = []; let size = 0;
+  const box = (t, ...c) => { const l = c.reduce((a, b) => a + b.length, 8), b = new Uint8Array(l), v = new DataView(b.buffer);
+    v.setUint32(0, l); for (let i = 0; i < 4; i++) b[4 + i] = t.charCodeAt(i); let o = 8; for (const x of c) { b.set(x, o); o += x.length; } return b; };
+  const ints = (...a) => { const b = new Uint8Array(a.length * 4), v = new DataView(b.buffer); a.forEach((x, i) => v.setUint32(i * 4, x >>> 0)); return b; };
+  const raw = b => u8.slice(b.s, b.e);
+  const allChunks = tracks.flatMap(t => t.chunks).sort((a, b) => a.off - b.off);
+  let mdatLen = 0; for (const c of allChunks) { c.pos = mdatLen; mdatLen += c.len; }
+  const dur = t => t.samples.reduce((a, s) => a + s.dur, 0);
+  // durations are written as 32-bit (version 0) fields
+  const movDur = Math.max(...tracks.map(t => Math.round(dur(t) * movTs / t.ts)));
+  const head32 = (b, d) => { // rewrite mvhd/tkhd/mdhd as version 0 with a new duration
+    const v1 = u8[b.d] === 1, src = b.d + 4, dOff = b.t === 'tkhd' ? 4 : 0;
+    const times = v1 ? [u64(src), u64(src + 8)] : [dv.getUint32(src), dv.getUint32(src + 4)];
+    const mid = v1 ? (b.t === 'tkhd' ? [dv.getUint32(src + 16), dv.getUint32(src + 20)] : [dv.getUint32(src + 16)]) : (b.t === 'tkhd' ? [dv.getUint32(src + 8), dv.getUint32(src + 12)] : [dv.getUint32(src + 8)]);
+    const rest = u8.slice(v1 ? src + (b.t === 'tkhd' ? 32 : 28) : src + (b.t === 'tkhd' ? 20 : 16), b.e);
+    const fl = dv.getUint32(b.d) & 0xffffff;
+    const head = ints(b.t === 'tkhd' ? (fl | 3) : fl, Math.min(times[0], 4294967295), Math.min(times[1], 4294967295), ...mid);
+    return box(b.t, head, ints(d), rest); };
+  const stblFor = (t, chunkOff) => {
+    const ss = t.samples, stts = []; for (const s of ss) { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); }
+    const out = [raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
+    if (ss.some(s => s.cto)) { const c = []; for (const s of ss) { const l = c[c.length - 1]; if (l && l[1] === s.cto) l[0]++; else c.push([1, s.cto]); }
+      out.push(box('ctts', ints(ss.some(s => s.cto < 0) ? 0x01000000 : 0, c.length, ...c.flat()))); }
+    const sc = []; t.chunks.forEach((c, i) => { const l = sc[sc.length - 1]; if (!l || l[1] !== c.n) sc.push([i + 1, c.n, 1]); });
+    out.push(box('stsc', ints(0, sc.length, ...sc.flat())));
+    out.push(box('stsz', ints(0, 0, ss.length, ...ss.map(s => s.size))));
+    out.push(box('stco', ints(0, t.chunks.length, ...t.chunks.map(c => chunkOff + c.pos))));
+    if (t.vide) { const sync = []; ss.forEach((s, i) => { if (!(s.flags & 0x10000)) sync.push(i + 1); });
+      if (sync.length && sync.length < ss.length) out.push(box('stss', ints(0, sync.length, ...sync))); }
+    return box('stbl', ...out); };
+  const ftyp = box('ftyp', new TextEncoder().encode('isom'), ints(512), new TextEncoder().encode('isomiso2mp41' + (tracks.some(t => t.vide) ? 'avc1' : '')));
+  const build = chunkOff => box('moov', head32(mvhd, movDur), ...tracks.map(t => box('trak', head32(t.tkhd, Math.round(dur(t) * movTs / t.ts)),
+    box('mdia', head32(t.mdhd, dur(t)), raw(t.hdlr), box('minf', ...t.others.map(raw), stblFor(t, chunkOff))))));
+  const moovLen = build(0).length, dataStart = ftyp.length + moovLen + 8;
+  if (dataStart + mdatLen > 4294967295) return null;
+  const out = new Uint8Array(dataStart + mdatLen); let o = 0;
+  out.set(ftyp, o); o += ftyp.length; const mo = build(dataStart); out.set(mo, o); o += mo.length;
+  new DataView(out.buffer).setUint32(o, mdatLen + 8); out.set([109, 100, 97, 116], o + 4); o += 8;
+  for (const c of allChunks) { out.set(u8.subarray(c.off, c.off + c.len), o); o += c.len; }
+  return out;
+}
+
+
+const $ = id => document.getElementById(id), out = [], log = s => { out.push(s); $('out').value = out.join('\n'); };
+const st = t => $('st').textContent = t;
+const cv = $('cv'), x = cv.getContext('2d');
+const PATCH = [['black', '#000000'], ['white', '#ffffff'], ['gray', '#808080'], ['pink', '#f8d3e0']];
+function draw(t) { PATCH.forEach(([, c], i) => { x.fillStyle = c; x.fillRect((i % 2) * 320, Math.floor(i / 2) * 180, 320, 180); });
+  x.fillStyle = '#4f4a66'; x.fillRect(((t * 200) % 640) - 20, 170, 40, 20); }
+draw(0);
+function env() {
+  const u = navigator.userAgent; log('■ 環境'); log('UA: ' + u);
+  log('タッチ: ' + (navigator.maxTouchPoints || 0) + ' / 画面: ' + screen.width + 'x' + screen.height + ' @' + devicePixelRatio);
+  log('MediaRecorder: ' + !!window.MediaRecorder + ' / captureStream: ' + !!cv.captureStream + ' / AudioContext: ' + !!(window.AudioContext || window.webkitAudioContext));
+  let gl = false; try { gl = !!document.createElement('canvas').getContext('webgl'); } catch (_) {} log('WebGL: ' + gl);
+  log('audioSession: ' + !!navigator.audioSession);
+  let share = 'なし'; try { if (navigator.canShare) share = navigator.canShare({files: [new File([new Uint8Array(8)], 't.mp4', {type: 'video/mp4'})]}) ? '動画を共有できる' : '動画は共有できない'; } catch (e) { share = 'エラー ' + e.name; } log('共有メニュー: ' + share);
+  const list = ['video/mp4;codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4;codecs=avc1,mp4a', 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1,opus', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  let chosen = ''; log('■ 録画できる形式');
+  for (const m of list) { let ok = false; try { ok = window.MediaRecorder && MediaRecorder.isTypeSupported(m); } catch (_) {} log((ok ? '○ ' : '× ') + m); if (ok && !chosen) chosen = m; }
+  log('→ ツールが選ぶ形式: ' + (chosen || '（なし）')); return chosen;
+}
+function boxes(u8) { // summary of an mp4
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength), s = o => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
+  const find = t => { for (let i = 4; i + 4 < u8.length; i++) if (u8[i] === t.charCodeAt(0) && s(i) === t) return i - 4; return -1; };
+  let moof = 0; for (let i = 4; i + 4 < u8.length; i++) if (u8[i] === 109 && s(i) === 'moof') moof++;
+  const r = {moof}; const mv = find('mvhd'); if (mv >= 0) { const v = u8[mv + 8]; r.ts = dv.getUint32(mv + (v ? 28 : 20)); r.dur = v ? dv.getUint32(mv + 36) : dv.getUint32(mv + 24); }
+  const c = find('colr'); if (c >= 0 && s(c + 8) === 'nclx') r.colr = {prim: dv.getUint16(c + 12), tr: dv.getUint16(c + 14), mat: dv.getUint16(c + 16), full: !!(u8[c + 18] & 0x80)};
+  r.codec = ['avc1', 'avc3', 'vp09', 'hvc1', 'mp4a', 'Opus'].filter(t => find(t) >= 0).join('+'); return r; }
+function rms(ch, sr, a, b) { let s = 0, n = 0; for (let i = Math.floor(a * sr); i < Math.min(ch.length, b * sr); i++) { s += ch[i] * ch[i]; n++; } return n ? Math.sqrt(s / n) : 0; }
+$('go').onclick = async () => {
+  $('go').disabled = true; out.length = 0; const mime = env();
+  if (!window.MediaRecorder || !cv.captureStream) { log('→ このブラウザでは動画を作れません'); st('おわり'); $('copy').disabled = false; return; }
+  const a = new (window.AudioContext || window.webkitAudioContext)(); try { await a.resume(); } catch (_) {}
+  log('■ 録画テスト'); log('音声のサンプルレート: ' + a.sampleRate + ' / 状態: ' + a.state);
+  st('録画中…画面を開いたままにしてね');
+  const dest = a.createMediaStreamDestination(), osc = a.createOscillator(), g = a.createGain(); osc.frequency.value = 440; g.gain.value = 0.3; osc.connect(g); g.connect(dest);
+  let keep = null; try { keep = a.createConstantSource(); const kg = a.createGain(); keep.offset.value = 1; kg.gain.value = 0.00001; keep.connect(kg); kg.connect(dest); keep.start(); } catch (e) { log('無音キープ: 使えない ' + e.name); }
+  const vs = cv.captureStream(30), stream = new MediaStream([...vs.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+  let rec; try { rec = new MediaRecorder(stream, mime ? {mimeType: mime, videoBitsPerSecond: 6000000, audioBitsPerSecond: 160000} : {}); } catch (e) { log('指定の形式で録画できず: ' + e.name); rec = new MediaRecorder(stream); }
+  const chunks = []; rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); }; const stopped = new Promise(r => rec.onstop = r);
+  let hidden = false; const onVis = () => { if (document.hidden) hidden = true; }; document.addEventListener('visibilitychange', onVis);
+  rec.start(500); const lead = 0.5, tone = 2.0, tail = 0.8, ts = a.currentTime + lead; osc.start(ts); osc.stop(ts + tone);
+  const w0 = performance.now();
+  await new Promise(res => { const f = () => { const now = a.currentTime; draw(now); if (now >= ts + tone + tail || performance.now() - w0 > 15000) { res(); return; } requestAnimationFrame(f); }; f(); });
+  rec.stop(); await stopped; try { keep && keep.stop(); } catch (_) {} vs.getTracks().forEach(t => t.stop()); document.removeEventListener('visibilitychange', onVis);
+  log('録画にかかった時間: ' + ((performance.now() - w0) / 1000).toFixed(2) + '秒（目安 3.3秒）' + (hidden ? ' ※途中で画面を離れた' : ''));
+  log('録画の形式: ' + (rec.mimeType || '(不明)'));
+  const raw = new Uint8Array(await new Blob(chunks).arrayBuffer()); log('元のファイル: ' + (raw.length / 1024).toFixed(0) + 'KB');
+  const isMp4 = /mp4/.test(rec.mimeType || mime || '');
+  let fixed = raw;
+  if (isMp4) { const b0 = boxes(raw); log('元: 分割=' + b0.moof + ' / 長さ=' + (b0.ts ? (b0.dur / b0.ts).toFixed(2) + '秒' : '?') + ' / 中身=' + b0.codec + ' / 色ラベル=' + JSON.stringify(b0.colr || 'なし'));
+    st('仕上げ中…'); try { const f = defragMp4(raw.buffer); if (f) fixed = f; log('仕上げ: ' + (f ? 'OK' : 'しなかった（分割なし）')); } catch (e) { log('仕上げ: エラー ' + e.message); }
+    const b1 = boxes(fixed); log('後: 分割=' + b1.moof + ' / 長さ=' + (b1.ts ? (b1.dur / b1.ts).toFixed(2) + '秒' : '?') + ' / 色ラベル=' + JSON.stringify(b1.colr || 'なし')); }
+  const blob = new Blob([fixed], {type: isMp4 ? 'video/mp4' : 'video/webm'}), url = URL.createObjectURL(blob);
+  st('再生して色を調べています…');
+  const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.src = url;
+  try { await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error('再生できない')); setTimeout(() => rej(new Error('タイムアウト')), 8000); });
+    log('■ 再生テスト'); log('このブラウザが読んだ長さ: ' + v.duration + '秒（目安 3.3秒前後）');
+    await new Promise(r => { v.onseeked = r; v.currentTime = 1.2; setTimeout(r, 3000); });
+    const c2 = document.createElement('canvas'); c2.width = 640; c2.height = 360; const x2 = c2.getContext('2d'); x2.drawImage(v, 0, 0, 640, 360);
+    const px = (X, Y) => [...x2.getImageData(X, Y, 1, 1).data].slice(0, 3);
+    const k = px(160, 60), wv = px(480, 60), gr = px(160, 300), pk = px(480, 300);
+    log('黒: ' + k + '（0付近が正しい）/ 白: ' + wv + '（255付近が正しい）'); log('灰: ' + gr + '（128付近）/ ピンク: ' + pk + '（248,211,224付近）');
+    const washed = k[0] > 30 || wv[0] < 222; log('→ 色: ' + (washed ? '白っぽい・くすんでいる可能性あり' : 'OK'));
+  } catch (e) { log('再生テスト: ' + e.message); }
+  try { const ab = await blob.arrayBuffer(); const buf = await a.decodeAudioData(ab); const ch = buf.getChannelData(0), sr = buf.sampleRate;
+    log('■ 音声テスト'); log('音声の長さ: ' + buf.duration.toFixed(2) + '秒');
+    let on = -1, off = -1; for (let t = 0; t < buf.duration; t += 0.01) { const r = rms(ch, sr, t, t + 0.01); if (r > 0.05) { if (on < 0) on = t; off = t + 0.01; } }
+    log('音が鳴っていた区間: ' + on.toFixed(2) + '〜' + off.toFixed(2) + '秒（2.00秒ぶん鳴るのが正しい）→ ' + (off - on).toFixed(2) + '秒');
+    log('→ 音の最後: ' + ((off - on) > 1.95 ? 'OK' : '切れている可能性あり'));
+  } catch (e) { log('音声テスト: このブラウザでは確認できませんでした（' + e.name + '）'); }
+  log('■ おわり'); st('おわり！「結果をコピー」を押して送ってね'); $('copy').disabled = false; $('go').disabled = false;
+};
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText($('out').value); st('コピーしました'); } catch (_) { $('out').select(); document.execCommand('copy'); st('コピーしました'); } };
+</script></body></html>
