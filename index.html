@@ -1708,6 +1708,40 @@ function spsClearFullRange(nal) {
   for (const x of rb) { if (zeros >= 2 && x <= 3) { outN.push(3); zeros = 0; } outN.push(x); zeros = x === 0 ? zeros + 1 : 0; }
   return new Uint8Array(outN); }
 
+
+/* ---------- colour-range label match (2026-11-26) ----------
+   iPhone Safari writes H.264 whose own header (SPS) says "limited range" – and the picture really is
+   limited range – but labels the MP4 container (colr) as "full range". Apple's Photos app trusts the
+   SPS and looks right; Chrome and other players trust the container label and show the video washed
+   out (blacks become grey). matchColrToSps() makes the container label agree with the SPS. The picture
+   data is not touched, and files whose two labels already agree (e.g. Chrome's) are left alone. */
+function matchColrToSps(stsd) {
+  const b = stsd.slice(), dv = new DataView(b.buffer, b.byteOffset, b.byteLength), str = o => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  const eStart = 16; if (b.length < eStart + 94) return stsd;
+  const eSize = dv.getUint32(eStart), eType = str(eStart + 4); if (eType !== 'avc1' && eType !== 'avc3') return stsd;
+  let colr = null, avcc = null;
+  for (let o = eStart + 86; o + 8 <= eStart + eSize;) { const sz = dv.getUint32(o); if (sz < 8) break; const t = str(o + 4);
+    if (t === 'colr' && str(o + 8) === 'nclx') colr = o; if (t === 'avcC') avcc = {o, sz}; o += sz; }
+  if (colr === null || !avcc || !(b[colr + 18] & 0x80)) return stsd;          // nothing labelled full
+  const c = b.subarray(avcc.o + 8, avcc.o + avcc.sz); if ((c[5] & 0x1f) < 1) return stsd;
+  const len = (c[6] << 8) | c[7], full = spsRange(c.subarray(8, 8 + len));
+  if (full === false) { b[colr + 18] &= 0x7f; return b; }
+  return stsd; }
+function spsRange(nal) { // true = full, false = limited (incl. not signalled), null = could not read
+  try {
+    const rb = []; for (let i = 1; i < nal.length; i++) { if (nal[i] === 3 && rb.length >= 2 && rb[rb.length - 1] === 0 && rb[rb.length - 2] === 0) continue; rb.push(nal[i]); }
+    let p = 0; const bit = () => { if (p >> 3 >= rb.length) throw 0; return (rb[p >> 3] >> (7 - (p++ & 7))) & 1; }, u = n => { let v = 0; while (n--) v = v * 2 + bit(); return v; };
+    const ue = () => { let z = 0; while (!bit()) { if (++z > 31) throw 0; } return (2 ** z) - 1 + u(z); }, se = () => { const k = ue(); return k & 1 ? (k + 1) / 2 : -k / 2; };
+    const prof = u(8); u(16); ue();
+    if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(prof)) { const cf = ue(); if (cf === 3) u(1); ue(); ue(); u(1); if (u(1)) return null; }
+    ue(); const poc = ue(); if (poc === 0) ue(); else if (poc === 1) { u(1); se(); se(); const k = ue(); for (let i = 0; i < k; i++) se(); }
+    ue(); u(1); ue(); ue(); if (!u(1)) u(1); u(1); if (u(1)) { ue(); ue(); ue(); ue(); }
+    if (!u(1)) return false;                       // no VUI: limited by default
+    if (u(1)) { if (u(8) === 255) u(32); } if (u(1)) u(1);
+    if (!u(1)) return false;                       // no video_signal_type: limited by default
+    u(3); return !!bit();
+  } catch (e) { return null; } }
+
 function defragMp4(buf) {
   const u8 = new Uint8Array(buf), dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const str = o => String.fromCharCode(u8[o], u8[o + 1], u8[o + 2], u8[o + 3]);
@@ -1787,7 +1821,7 @@ function defragMp4(buf) {
     return box(b.t, head, ints(d), rest); };
   const stblFor = (t, chunkOff) => {
     const ss = t.samples, stts = []; for (const s of ss) { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); }
-    const out = [raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
+    const out = [t.vide ? matchColrToSps(raw(t.stsd)) : raw(t.stsd), box('stts', ints(0, stts.length, ...stts.flat()))];
     if (ss.some(s => s.cto)) { const c = []; for (const s of ss) { const l = c[c.length - 1]; if (l && l[1] === s.cto) l[0]++; else c.push([1, s.cto]); }
       out.push(box('ctts', ints(ss.some(s => s.cto < 0) ? 0x01000000 : 0, c.length, ...c.flat()))); }
     const sc = []; t.chunks.forEach((c, i) => { const l = sc[sc.length - 1]; if (!l || l[1] !== c.n) sc.push([i + 1, c.n, 1]); });
