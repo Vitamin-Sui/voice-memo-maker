@@ -240,12 +240,16 @@ $('go').onclick = async () => {
   const v = document.createElement('video'); v.muted = true; v.playsInline = true; v.src = url;
   try { await new Promise((res, rej) => { v.onloadedmetadata = res; v.onerror = () => rej(new Error('再生できない')); setTimeout(() => rej(new Error('タイムアウト')), 8000); });
     log('■ 再生テスト'); log('このブラウザが読んだ長さ: ' + v.duration + '秒（目安 3.3秒前後）');
-    await new Promise(r => { v.onseeked = r; v.currentTime = 1.2; setTimeout(r, 3000); });
+    // iPhone Safari only paints a frame after the video has actually played, so play a moment, then pause
+    try { await v.play(); } catch (_) {}
+    await new Promise(r => { const chk = () => { if (v.currentTime >= 1.2) { v.pause(); r(); } }; v.ontimeupdate = chk; setTimeout(() => { v.pause(); r(); }, 4000); });
+    await new Promise(r => setTimeout(r, 200));
     const c2 = document.createElement('canvas'); c2.width = 640; c2.height = 360; const x2 = c2.getContext('2d'); x2.drawImage(v, 0, 0, 640, 360);
     const px = (X, Y) => [...x2.getImageData(X, Y, 1, 1).data].slice(0, 3);
     const k = px(160, 60), wv = px(480, 60), gr = px(160, 300), pk = px(480, 300);
     log('黒: ' + k + '（0付近が正しい）/ 白: ' + wv + '（255付近が正しい）'); log('灰: ' + gr + '（128付近）/ ピンク: ' + pk + '（248,211,224付近）');
-    const washed = k[0] > 30 || wv[0] < 222; log('→ 色: ' + (washed ? '白っぽい・くすんでいる可能性あり' : 'OK'));
+    if (wv[0] + wv[1] + wv[2] === 0) log('→ 色: このブラウザでは動画の色を読み取れませんでした');
+    else { const washed = k[0] > 30 || wv[0] < 222; log('→ 色: ' + (washed ? '白っぽい・くすんでいる可能性あり' : 'OK')); }
   } catch (e) { log('再生テスト: ' + e.message); }
   try { const ab = await blob.arrayBuffer(); const buf = await a.decodeAudioData(ab); const ch = buf.getChannelData(0), sr = buf.sampleRate;
     log('■ 音声テスト'); log('音声の長さ: ' + buf.duration.toFixed(2) + '秒');
